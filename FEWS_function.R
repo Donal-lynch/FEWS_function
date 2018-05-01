@@ -2,19 +2,146 @@
 #' @param logprice: vector of logarithm of prices at the given time
 #' @param ID: vector of distinct identification number of consumer goods
 #' @param weight: vector of expenditure weights used in the regressions
-#' @param windowLength: single number for length of windows of the data thatregressions are fit on
-#' @param splicePos: The positon on which to splice the windows together. This can be a numnber 1 - window length or 'mean' for a mean splice
+#' @param windowLength: single number for length of windows of the data that regressions are fit on
+#' @param splicePos: The positon on which to splice the windows together.
+#' This can be a number from 1 to windowLength or
+#' any of c("window", "half","end", "mean", "movement"). 'mean' gives the geoMean of all possible window splices
 #' @param timeUnit: Format of data ie. day, week, month, quarter, year. Can be left blank and the code can determine it
 #' @param run_summaries: section of code to run a summary, recommend off while developing
 #' @param numCores: Number of cores to use for parrallell computaion. Convention is parallel::detectCores()-1 on local machines
 
-# library(PriceStatsNZ)
 library(dplyr)
 library(tidyr)
 library(stringr)
 library(MatrixModels)
 library(doSNOW)
 library(data.table)
+
+FEWS <-  function(times, logprice, ID, weight = NULL, windowLength, splicePos = 'mean',
+                  timeUnit = NULL, numCores=NULL) {
+  # Function to calculte the Fixed effects window splice price index from
+  # a time series of prices
+  # Arguments:
+  #   See top of script for detials of each argument
+  #
+  # Returns:
+  #   output - a list of items:
+  #     FE.list - a list of dataframes. Each dataframe relates to one window in
+  #       the series. The dataframes contain the output coefficeints from the FE
+  #       model, before the splicing takes place.
+  #     FEWS.df - a dataframe of the FEWS index
+
+
+  timer <- Sys.time() # Get the current time
+
+
+  # check arguments are all legit
+  c(times, logprice, ID, weight, windowLength, splicePos, timeUnit) %=%
+    check_inputs (times = times,
+                  logprice = logprice,
+                  ID = ID,
+                  weight = weight,
+                  windowLength = windowLength,
+                  splicePos = splicePos,
+                  timeUnit = timeUnit)
+
+
+  # make a data frame from all the in inputs
+  prices.df <- data.frame(times = times, logprice = logprice, weight = weight,
+                          ID = ID)
+
+  # It is essential that the data frame is sorted by date
+  # use an if because sorting is slow, but testing is fast
+  if (is.unsorted(prices.df$times)){
+    prices.df <- prices.df [order(prices.df$times), ]
+  }
+
+  # Get the timeUnit if use did not supply it. Otherwise, check that the
+  # time unit is sensible
+  timeUnit <- GetTimeUnit (prices.df$times, timeUnit = timeUnit)
+
+  if (is.null(timeUnit)){
+    cat("Returning Null as there as a problem with the time data")
+    return (NULL)
+  }
+
+  # Impute missing times
+  prices.df <- TimeImpute (prices.df, timeUnit, verbose = TRUE)
+
+  # Get the indexs of the start of each window
+  windowStarts <- GetWindowStarts (df = prices.df,
+                                   timeUnit = timeUnit,
+                                   windowLength = windowLength)
+
+  numWindows <- length(windowStarts)
+  cat('Number of windows:',numWindows,'\n')
+
+
+  if (!is.null(numCores)) {
+    # Starting Parallel =======================================================
+    cores <- numCores
+    cl <- makeSOCKcluster(cores)
+    registerDoSNOW(cl)
+
+    cat('Running regression on each window...\n')
+
+    numOps <- numWindows
+    rqdPacks <- c("dplyr", "MatrixModels", "stringr")
+    rqdData <- c("FE_model", "lmfun", "getWinDates")
+
+    pb <- txtProgressBar(min=1, max=numOps, style=3)
+    progress <- function(n) setTxtProgressBar(pb, n)
+    opts <- list(progress=progress) # Start the PB
+    coefs <-
+      foreach(i=1:numOps, .packages = rqdPacks, .options.snow = opts,
+              .combine = "cbind", .export = rqdData) %dopar% {
+                FE_model (stDate = windowStarts[i],
+                          df = prices.df,
+                          timeUnit = timeUnit,
+                          windowLength = windowLength)
+              }
+    close(pb) # End The PB
+    stopCluster(cl)
+    # Ending Parallel ========================================================
+  } else {
+    # Non parallell code
+    coefs <- lapply(X = windowStarts,
+                    FUN = FE_model,
+                    df = prices.df,
+                    timeUnit = timeUnit,
+                    windowLength = windowLength)
+
+    # this list needs to be coerced into a df to match the foreach output
+    # First convert each individual item to a df
+    coefs <- lapply(coefs, FUN = as.data.frame)
+    # Now convert the whole thing:
+    coefs <- as.data.frame(coefs)
+  }
+
+
+  # Convert back fom log price
+  coefs <- exp (coefs)
+  # Add in a row of 1's for the baseline month. This is the FE indexes
+  FEindexes <- rbind (rep(1, each = ncol(coefs)), coefs)
+
+  # FE.list is a list of each window's fixed effects index
+  FE.list <- GetFE (FEindexes = FEindexes,
+                    windowStarts = windowStarts,
+                    timeUnit = timeUnit,
+                    windowLength = windowLength)
+
+  # Make the FEWS with from the FE.list
+  FEWS.df <- GetFEWS (FE.list = FE.list,
+                      windowLength = windowLength,
+                      splicePos = splicePos)
+
+
+  # Wrap the output in a list
+  output <- list(FE.list=FE.list, FEWS.df=FEWS.df)
+  cat('\nFinished. It took',round(Sys.time() - timer,2),'seconds\n\n\n')
+  return(output)
+}
+
 
 
 #### HELPER FUNCTIONS ####
@@ -490,129 +617,5 @@ splice_update <- function (win_old, win_new, splicePos){
   return (update_factor)
 }
 
-
-
-TextSender <- function () {
-  library("RPushbullet")
-  library("httr")
-  pbPost("note", paste0("FEWS run"),
-         content(GET("http://numbersapi.com/random/trivia")))
-}
-
-
-#### Main Function ####
-
-FEWS <-  function(times, logprice, ID, weight, windowLength, splicePos = 'mean',
-                  timeUnit = NULL, numCores=NULL) {
-
-  timer <- Sys.time() # Get the current time
-
-
-  # check arguments are all legit
-  c(times, logprice, ID, weight, windowLength, splicePos, timeUnit) %=%
-    check_inputs (times = times,
-                  logprice = logprice,
-                  ID = ID,
-                  weight = weight,
-                  windowLength = windowLength,
-                  splicePos = splicePos,
-                  timeUnit = timeUnit)
-
-
-  # make a data frame from all the in inputs
-  prices.df <- data.frame(times = times, logprice = logprice, weight = weight,
-                          ID = ID)
-
-  # It is essential that the data frame is sorted by date
-  # use an if because sorting is slow, but testing is fast
-  if (is.unsorted(prices.df$times)){
-    prices.df <- prices.df [order(prices.df$times), ]
-  }
-
-  # Get the timeUnit if use did not supply it. Otherwise, check that the
-  # time unit is sensible
-  timeUnit <- GetTimeUnit (prices.df$times, timeUnit = timeUnit)
-
-  if (is.null(timeUnit)){
-    cat("Returning Null as there as a problem with the time data")
-    return (NULL)
-  }
-
-  # Impute missing times
-  prices.df <- TimeImpute (prices.df, timeUnit, verbose = TRUE)
-
-  # Get the indexs of the start of each window
-  windowStarts <- GetWindowStarts (df = prices.df,
-                                   timeUnit = timeUnit,
-                                   windowLength = windowLength)
-
-  numWindows <- length(windowStarts)
-  cat('Number of windows:',numWindows,'\n')
-
-
-  if (!is.null(numCores)) {
-    # Starting Parallel =======================================================
-    cores <- numCores
-    cl <- makeSOCKcluster(cores)
-    registerDoSNOW(cl)
-
-    cat('Running regression on each window...\n')
-
-    numOps <- numWindows
-    rqdPacks <- c("dplyr", "MatrixModels", "stringr")
-    rqdData <- c("FE_model", "lmfun", "getWinDates")
-
-    pb <- txtProgressBar(min=1, max=numOps, style=3)
-    progress <- function(n) setTxtProgressBar(pb, n)
-    opts <- list(progress=progress) # Start the PB
-    coefs <-
-      foreach(i=1:numOps, .packages = rqdPacks, .options.snow = opts,
-              .combine = "cbind", .export = rqdData) %dopar% {
-                FE_model (stDate = windowStarts[i],
-                          df = prices.df,
-                          timeUnit = timeUnit,
-                          windowLength = windowLength)
-              }
-    close(pb) # End The PB
-    stopCluster(cl)
-    # Ending Parallel ========================================================
-  } else {
-    # Non parallell code
-    coefs <- lapply(X = windowStarts,
-                    FUN = FE_model,
-                    df = prices.df,
-                    timeUnit = timeUnit,
-                    windowLength = windowLength)
-
-    # this list needs to be coerced into a df to match the foreach output
-    # First convert each individual item to a df
-    coefs <- lapply(coefs, FUN = as.data.frame)
-    # Now convert the whole thing:
-    coefs <- as.data.frame(coefs)
-  }
-
-
-  # Convert back fom log price
-  coefs <- exp (coefs)
-  # Add in a row of 1's for the baseline month. This is the FE indexes
-  FEindexes <- rbind (rep(1, each = ncol(coefs)), coefs)
-
-  # FE.list is a list of each window's fixed effects index
-  FE.list <- GetFE (FEindexes = FEindexes,
-                    windowStarts = windowStarts,
-                    timeUnit = timeUnit,
-                    windowLength = windowLength)
-
-  # Make the FEWS with from the FE.list
-  FEWS.df <- GetFEWS (FE.list = FE.list,
-                      windowLength = windowLength,
-                      splicePos = splicePos)
-
-
-  # Wrap the output in a list
-  output <- list(FE.list=FE.list, FEWS.df=FEWS.df)
-  cat('\nFinished. It took',round(Sys.time() - timer,2),'seconds\n\n\n')
-  return(output)
-}
 
 
