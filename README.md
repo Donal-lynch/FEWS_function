@@ -1,4 +1,4 @@
-.# FEWS_function
+# FEWS_function
 This function aims to offer a versatile implementation of the FEWS index for public use.
 
 Licence: GNU GPLv3
@@ -40,4 +40,4 @@ The intention is that this entire script is sourced and then the `FEWS()` functi
 The time unit is required to impute the data. If there are missing time entries, or time entireties with no prices, the last time which does contain data is copied until the next time with data.
 
 ## Parallel Computing
-The doSnow pacakge is used to run on mutliple cores. The only part of the code which uses parrallelisation is in performing the linear regressions. Good practise, for running on a local machine, for choosing the number of cores is to use the number of cores available minus one (`parallel::detectCores()-1`). If you running on shared server, even better practise is to check what resources are available before you use parallelisation
+The doSnow pacakge is used to run on mutliple cores. The only part of the code which uses parrallelisation is in performing the linear regressions. Good practise, for running on a local machine, for choosing the number of cores is to use the number of cores available minus one (`parallel::detectCores()-1`). If you running on shared server, even better practise is to check what resources are available before you use parallelisation.
