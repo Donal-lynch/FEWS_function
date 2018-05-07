@@ -4,10 +4,11 @@
 #' @param weight: vector of expenditure weights used in the regressions
 #' @param window_length: single number for length of windows of the data that regressions are fit on
 #' @param splice_pos: The positon on which to splice the windows together.
-#' This can be a number from 1 to window_length or
-#' any of c("window", "half","movement", "mean"). 'mean' gives the geoMean of all possible window splices
+#' This can be a number from 1 to window_length or any of c("window", "half","movement", "mean").
 #' @param time_unit: Format of data ie. day, week, month, quarter, year. Can be left blank and the code can determine it
 #' @param num_cores: Number of cores to use for parrallell computaion. Convention is parallel::detectCores()-1 on local machines
+#' @param return_fe_list: Option to return the indexes from all FE windows
+
 
 library(dplyr)
 library(tidyr)
@@ -17,22 +18,22 @@ library(doSNOW)
 library(data.table)
 
 FEWS <-  function(times, logprice, id, window_length, weight = NULL,
-                  splice_pos = "mean", time_unit = NULL, num_cores=NULL) {
+                  splice_pos = "mean", return_fe_list = FALSE,
+                  time_unit = NULL, num_cores=NULL) {
   # Function to calculte the Fixed effects window splice price index from
   # a time series of prices
   # Arguments:
   #   See top of script for detials of each argument
   #
   # Returns:
-  #   output - a list of items:
+  #   output - a list of 1 or 2 items, depeding on return_fe_list argument.
+  #     fews_df - a dataframe of the FEWS index
+  #   OPTIONAL RETURN:
   #     fe_list - a list of dataframes. Each dataframe relates to one window in
   #       the series. The dataframes contain the output coefficeints from the FE
   #       model, before the splicing takes place.
-  #     fews_df - a dataframe of the FEWS index
-
 
   timer <- Sys.time() # Get the current time
-
 
   # check arguments are all legit
   c(times, logprice, id, weight, window_length, splice_pos, time_unit) %=%
@@ -138,10 +139,17 @@ FEWS <-  function(times, logprice, id, window_length, weight = NULL,
                       splice_pos = splice_pos)
 
 
+  cat("\nFinished. It took", round(Sys.time() - timer, 2), "seconds\n\n\n")
+
+  if (return_fe_list) {
   # Wrap the output in a list
   output <- list(fe_list = fe_list, fews_df = fews_df)
-  cat("\nFinished. It took", round(Sys.time() - timer, 2), "seconds\n\n\n")
   return(output)
+  } else {
+    # Wrap the output in a list of one item. This is so that the return type is
+    # same either way
+    output <- list(fews_df = fews_df)
+  }
 }
 
 
@@ -408,20 +416,24 @@ FE_model <- function(st_date, dframe, time_unit, window_length ) {
   # Run linear regression on every window and extract the coefficients
   # for the time values only
   # Arguments:
-  #     st_date - a sequence of dates indicating the start days of the windows
+  #     st_date - a date indicating the start day of the window
   #     dframe - a data frame
   # weight
   # time_unit
   # window_length
+
+
 
   # Get the dates of each day in this window
   win_dates <- get_win_dates(st_date, time_unit, window_length)
   # Subset dframe by the dates in this window
   dframe_win <- filter(dframe, times %in% win_dates)
 
+
   # Run the linear model and extract the coefficients from the regression
   lm_coefs_all <- lmfun(dframe_win) %>%
     coef()
+
 
   # Choose only the coefficients for month (disregard the intercept, and the
   # coefficients for the product id). This is done based on the name of the
@@ -448,11 +460,13 @@ lmfun <- function(dframe){
   # Returns
   #   modelOutput - the output of the linear model
 
+
   if (all(dframe$weight == 1)){
     weight <- NULL
   } else {
     weight <- dframe$weight
   }
+
 
   # Refactor the dates here. Otherwise columns are created in the regression
   # matrix with all zeros, corrosponding to dates not in the current window
@@ -477,15 +491,17 @@ lmfun <- function(dframe){
   # use the try catch as glm seems more robust, but glm4 is more
   # memory efficient with large dataframes (due to sparse = T)
 
-  result <- tryCatch({
-    model_output <- glm4(glm_formula, weights = weight,
-                         sparse = TRUE)
+  model_output <- tryCatch({
+    glm4(glm_formula, weights = weight,
+         sparse = TRUE)
   }, warning = function(w) {
-    # warning-handler-code
+    # cat("glm4 threw a warning, using glm\n")
+    glm(glm_formula, weights = weight)
   }, error = function(e) {
-    model_output <- glm(glm_formula, weights = weight)
+    # cat("glm4 threw an error, using glm\n")
+    glm(glm_formula, weights = weight)
   }, finally = {
-    # cleanup-code
+    # some finally code here
   })
 
   return(model_output)
