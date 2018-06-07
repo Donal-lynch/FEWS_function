@@ -1,29 +1,28 @@
-#' @param times: vector of the time (month) at which price observations were made
+#' @param times: vector of the times at which price observations were made. can be date or numeric
 #' @param logprice: vector of logarithm of prices at the given time
 #' @param id: vector of distinct identification number of consumer goods
 #' @param weight: vector of expenditure weights used in the regressions
 #' @param window_length: single number for length of windows of the data that regressions are fit on
 #' @param splice_pos: The positon on which to splice the windows together.
 #' This can be a number from 1 to window_length or any of c("window", "half","movement", "mean").
-#' @param time_unit: Format of data ie. day, week, month, quarter, year. Can be left blank and the code can determine it
 #' @param num_cores: Number of cores to use for parrallell computaion. Convention is parallel::detectCores()-1 on local machines
 #' @param return_fe_list: Option to return the indexes from all FE windows
 
 
 library(dplyr)
-library(tidyr)
-library(stringr)
 library(MatrixModels)
+library(glmnet)
 library(doSNOW)
-library(data.table)
+library(pbapply)
 
-FEWS <-  function(times, logprice, id, window_length, weight = NULL,
-                  splice_pos = "mean", return_fe_list = FALSE,
-                  time_unit = NULL, num_cores=NULL) {
-  # Function to calculte the Fixed effects window splice price index from
+
+# User Function -----------------------------------------------------------
+
+FEWS <-  function(arg_list) {
+  # Function to calculate the Fixed effects window splice price index from
   # a time series of prices
   # Arguments:
-  #   See top of script for detials of each argument
+  #   arg_list <- See top of script for detials of each list element
   #
   # Returns:
   #   output - a list of 1 or 2 items, depeding on return_fe_list argument.
@@ -35,19 +34,30 @@ FEWS <-  function(times, logprice, id, window_length, weight = NULL,
 
   timer <- Sys.time() # Get the current time
 
-  # check arguments are all legit
-  c(times, logprice, id, weight, window_length, splice_pos, time_unit) %=%
+  # unpack the arguments list:
+  c(times,
+    logprice,
+    id,
+    weight,
+    window_length,
+    splice_pos,
+    return_fe_list,
+    num_cores) %=% arg_list
+
+  # check arguments are all ok
+  c(times, logprice, id, weight, window_length, splice_pos) %=%
     check_inputs (times = times,
                   logprice = logprice,
                   id = id,
                   weight = weight,
                   window_length = window_length,
-                  splice_pos = splice_pos,
-                  time_unit = time_unit)
+                  splice_pos = splice_pos)
 
 
-  # make a data frame from all the in inputs
-  prices.df <- data.frame(times = times, logprice = logprice, weight = weight,
+  # make a data frame from all of the inputs
+  prices.df <- data.frame(times = times,
+                          logprice = logprice,
+                          weight = weight,
                           id = id)
 
   # It is essential that the data frame is sorted by date
@@ -56,22 +66,23 @@ FEWS <-  function(times, logprice, id, window_length, weight = NULL,
     prices.df <- prices.df [order(prices.df$times), ]
   }
 
-  # Get the time_unit if use did not supply it. Otherwise, check that the
-  # time unit is sensible
-  time_unit <- get_time_unit (prices.df$times, time_unit = time_unit)
+  # Now add a new column which will be used as the time variable.
+  # this is to allow the input to be either Dates of numeric
+  prices.df <- add_times_index (prices.df)
 
-  if (is.null(time_unit)){
-    cat("Returning Null as there as a problem with the time data")
-    return (NULL)
-  }
 
   # Impute missing times
-  prices.df <- impute_time (prices.df, time_unit, verbose = TRUE)
+  # prices.df <- time_imputer (dframe = prices.df,
+  #                            time_col = "times",
+  #                            price_col = "logprice",
+  #                            id_col = "id",
+  #                            time_unit = time_unit,
+  #                            weight_col = "weight")
 
-  # Get the indexs of the start of each window
-  window_st_days <- get_window_st_days (df = prices.df,
-                                   time_unit = time_unit,
-                                   window_length = window_length)
+
+  # Get the indexes of the start of each window
+  window_st_days <- get_window_st_days (dframe = prices.df,
+                                        window_length = window_length)
 
   num_windows <- length(window_st_days)
   cat("Number of windows:", num_windows, "\n")
@@ -86,7 +97,7 @@ FEWS <-  function(times, logprice, id, window_length, weight = NULL,
     cat("Running regression on each window...\n")
 
     num_ops <- num_windows
-    rqd_packs <- c("dplyr", "MatrixModels", "stringr")
+    rqd_packs <- c("dplyr", "MatrixModels", "glmnet")
     rqd_data <- c("FE_model", "lmfun", "get_win_dates")
 
     pb <- txtProgressBar(min = 1, max = num_ops, style = 3)
@@ -100,7 +111,6 @@ FEWS <-  function(times, logprice, id, window_length, weight = NULL,
               .export = rqd_data) %dopar% {
                 FE_model (st_date = window_st_days[i],
                           df = prices.df,
-                          time_unit = time_unit,
                           window_length = window_length)
               }
     close(pb) # End The PB
@@ -108,19 +118,19 @@ FEWS <-  function(times, logprice, id, window_length, weight = NULL,
     # Ending Parallel ========================================================
   } else {
     # Non parallell code
-    fe_indexes <- lapply(X = window_st_days,
-                    FUN = FE_model,
-                    df = prices.df,
-                    time_unit = time_unit,
-                    window_length = window_length)
+    fe_indexes <- pblapply(X = window_st_days,
+                         FUN = FE_model,
+                         df = prices.df,
+                         window_length = window_length)
 
     # this list needs to be coerced into a df to match the foreach output
-    # First convert each individual item to a df
+    # First convert each individual element into a df
     fe_indexes <- lapply(fe_indexes, FUN = as.data.frame)
     # Now convert the whole thing:
     fe_indexes <- as.data.frame(fe_indexes)
   }
 
+  cat("\nFE model complete. Splicing results together\n")
 
   # Convert back fom log price
   fe_indexes <- exp (fe_indexes)
@@ -129,32 +139,32 @@ FEWS <-  function(times, logprice, id, window_length, weight = NULL,
 
   # fe_list is a list of each window's fixed effects index
   fe_list <- get_fe_list (fe_indexes = fe_indexes,
-                    window_st_days = window_st_days,
-                    time_unit = time_unit,
-                    window_length = window_length)
+                          dframe = prices.df,
+                          window_st_days = window_st_days,
+                          window_length = window_length)
 
-  # Make the FEWS with from the fe_list
+  # Make the FEWS from the fe_list
   fews_df <- get_fews_df (fe_list = fe_list,
-                      window_length = window_length,
-                      splice_pos = splice_pos)
+                          window_length = window_length,
+                          splice_pos = splice_pos)
 
 
   cat("\nFinished. It took", round(Sys.time() - timer, 2), "seconds\n\n\n")
 
   if (return_fe_list) {
-  # Wrap the output in a list
-  output <- list(fe_list = fe_list, fews_df = fews_df)
-  return(output)
+    # Wrap the output in a list
+    output <- list(fe_list = fe_list, fews_df = fews_df)
+    return(output)
   } else {
-    # Wrap the output in a list of one item. This is so that the return type is
-    # same either way
+    # Wrap the output in a list of one item so output is always a list
     output <- list(fews_df = fews_df)
   }
 }
 
 
 
-#### HELPER FUNCTIONS ####
+
+### HELPER FUNCTIONS --------------------------------------------------------
 
 "%!in%" <- function(x, y) !("%in%" (x, y))
 
@@ -207,23 +217,23 @@ check_inputs <- function (times = times, logprice = logprice, id = id,
     stop("times and weight should be vectors of the same length")
   }else if (length(window_length) != 1 | class(window_length) != "numeric"){
     stop("window_length should be a single number")
-  } else if (!(class(times) %in% c("zoo", "Date", "numeric", "integer"))){
-    stop (paste("The price times class is: ",
-                class(times),
-                "\n The class must be a date or numeric"))
-  }
+  } #else if (!(class(times) %in% c("zoo", "Date", "numeric", "integer"))){
+  #   stop (paste("The price times class is: ",
+  #               class(times),
+  #               "\n The class must be a date or numeric"))
+  # }
 
 
-  time_units <- c("day", "week", "month", "quarter", "year")
-
-  if (!(missing(time_unit) | is.null(time_unit))) {
-    time_unit <- tolower(time_unit)
-    if (!(time_unit %in% time_units)) {
-      stop("time_unit of ", time_unit,
-           " is not a valid option. \n You must input one of: ",
-           paste(time_units, collapse = ", "))
-    }
-  }
+  # time_units <- c("day", "week", "month", "quarter", "year")
+  #
+  # if (!(missing(time_unit) | is.null(time_unit))) {
+  #   time_unit <- tolower(time_unit)
+  #   if (!(time_unit %in% time_units)) {
+  #     stop("time_unit of ", time_unit,
+  #          " is not a valid option. \n You must input one of: ",
+  #          paste(time_units, collapse = ", "))
+  #   }
+  # }
 
 
   splice_pos_all <- c("window", "half", "movement", "mean")
@@ -237,7 +247,7 @@ check_inputs <- function (times = times, logprice = logprice, id = id,
            paste(splice_pos_all, collapse = ", "))
     }
     # Theses two options all easy to convert to a number:
-    if (splice_pos ==  "window")  splice_pos <- 2
+    if (splice_pos ==  "window")  splice_pos <- 3
     if (splice_pos == "half") splice_pos <- ceiling(window_length / 2)
 
   } else{
@@ -249,141 +259,41 @@ check_inputs <- function (times = times, logprice = logprice, id = id,
     }
   }
 
-
-  if (class(times) == "numeric" | class(times) == "integer") {
-    times <- as.Date(times, origin = "1970-01-01")
-  }
-
   return (list(times = times, logprice = logprice, id = id, weight = weight,
-               window_length = window_length, splice_pos = splice_pos,
-               time_unit = time_unit))
+               window_length = window_length, splice_pos = splice_pos))
 }
 
 
-
-get_time_unit <- function (price_times, time_unit = NULL) {
-  # Calculates the frequency of the price observations.
-  # Confirm that the frequencey matches the user input frequency
+add_times_index <- function (dframe) {
+  # adds a new column of numbers corrosponding to the times column.
   # Args:
-  #   price_times: The times data for the price observations
+  #   dframe: a data frame with a times column
   #     NOTE: ***These should already be sorted***
-  #   time_unit: The Users expected time frequencey
   #
   # Returns:
-  #   time_unit - as determined by this func
-
-  # Get the time steps between every time entry
-  freq <- as.numeric(unique(price_times)) %>%
-    diff() %>%
-    mean()
-
-  test_freq <- function(freq, num)
-    # Tests if a a number is within 20% of a test number
-    if (freq > num * 0.8 & freq < num * 2){
-      return (TRUE)
-    } else (
-      return (FALSE)
-    )
-
-  if (test_freq(freq, 1)) {
-    time_unit.determined <- "day"
-  } else if (test_freq(freq, 7)) {
-    time_unit.determined <- "week"
-  } else if (test_freq(freq, 30.5)) {
-    time_unit.determined <- "month"
-  } else if (test_freq(freq, 91.25)) {
-    time_unit.determined <- "quarter"
-  } else if (test_freq(freq, 365)) {
-    time_unit.determined <- "year"
-  } else {
-    return(NULL)
-  }
-
-  # Only check if they match if user has entered a time unit
-  if (!(missing(time_unit) | is.null(time_unit))) {
-    if (time_unit.determined != time_unit) {
-      stop (paste("User expects dates to be", time_unit,
-                  ",but they look like", time_unit.determined))
-    }
-  }
-
-  return (time_unit.determined)
-
-}
-
-impute_time <- function(dframe, time_unit, verbose = TRUE) {
-  # Imputes missing time enteries by copying the previous available data
-  #
-  # Args:
-  #   dframe: A dataframe with the columns:"price_date" "rid" "price"
-  #   time_unit: a string of any of:
-  #             "day", "week", "month", "quarter", "year"
-  #   verbose: If TRUE, prints sample number of imputed days. Default is TRUE.
-  #
-  # Returns:
-  #   dframe: a dataframe as passed, but with missing times imputed
+  #   dframe - the same dframe with times_index column added
 
 
-  # Error handling:
-  if (!(c("times", "logprice", "weight", "id") %in%  colnames(dframe) %>%
-        all())) {
-    stop (paste("The data frame column names are: ",
-                colnames(dframe) %>% paste(collapse = ", "),
-                "\n The correct names should be: times,logprice, weight, id"))
-  }
+  # Converting to factor implitly orders by value or alphabetically
+  dframe$times_index <- dframe$times %>%
+    as.factor() %>%
+    as.numeric
 
-  # Make a sequence of all dates and compare it to the unique vals of the
-  # Date column
 
-  unique_dates <- (unique(dframe$times))
-  # order the dates
-  unique_dates <- unique_dates[order(unique_dates)]
-
-  all_dates <- seq.Date(from = unique_dates[1],
-                       to = unique_dates[length(unique_dates)],
-                       by = time_unit)
-
-  if (length(all_dates) > length(unique_dates)){
-    cat("There are", length(all_dates) - length(unique_dates),
-        "missing time values. This represents",
-        (length(all_dates) - length(unique_dates)) / length(all_dates) * 100,
-        "% of all dates. These will be imputed.\n")
-  }else if (length(all_dates) < length(unique_dates))  {
-    # There are some strange dates in the time series
-    stop("There are more dates than unique dates. Is your time unit correct?")
-  }else if (all(all_dates == unique_dates)) {
-    cat ("All dates accounted for. No need to impute.\n")
-    return (dframe) # No need to perform further computation
-  }
-
-  # Get the dates of all the missing days
-  missing_times <- all_dates[all_dates %!in% dframe$times]
-
-  # loop through all of the missing days and use the previous day's values
-  for (i in 1:length(missing_times)){
-    # copy the the time prior to the missing time
-    prev_time <- dframe[dframe$times == missing_times[i] - 1, ]
-    # Update the new time to have the same
-    prev_time$times <- missing_times[i]
-    dframe <- rbind(dframe, prev_time)
-  }
-  # Return the sorted data frame
-  dframe[order(dframe$times), ]
+  return (dframe)
 
 }
 
 
-
-get_window_st_days <- function (dframe, time_unit,  window_length) {
+get_window_st_days <- function (dframe, window_length) {
   # Calculate a sequence of dates corrosponding to the starts of each window
   # Args:
-  #     dframe - data frame with times colum
-  #     time_unit - one of "day", "week", "month", "quarter" or "year"
+  #     dframe - data frame with times_index colum
   #     window_length - the number of time_units per window
   # Returns:
   #     A date sequence corrosponding to the start date of each window
 
-  num_windows <- length(unique(dframe$times)) - window_length + 1
+  num_windows <- length(unique(dframe$times_index)) - window_length + 1
 
   if (num_windows < 0) {
     stop ("window lenght of ", window_length,
@@ -391,13 +301,13 @@ get_window_st_days <- function (dframe, time_unit,  window_length) {
           length(unique(dframe$times)))
   }
 
-  seq.Date(from = min(dframe$times),
-           by = time_unit,
-           length.out = num_windows)
+  seq(from = min(dframe$times_index),
+      by = 1,
+      length.out = num_windows)
 }
 
 
-get_win_dates <- function(st_date, time_unit, window_length){
+get_win_dates <- function(st_date, window_length){
   # Calculate a sequence of dates corrosponding to the dates in a window which
   # starts at st_date
   # Args:
@@ -407,43 +317,35 @@ get_win_dates <- function(st_date, time_unit, window_length){
   # Returns:
   #     A date sequence corrosponding to each date in the window
 
-  seq(st_date, by = time_unit, length.out = window_length)
+  seq(st_date, by = 1, length.out = window_length)
 }
 
 
 
-FE_model <- function(st_date, dframe, time_unit, window_length ) {
+FE_model <- function(st_date, dframe, window_length ) {
   # Run linear regression on every window and extract the coefficients
   # for the time values only
   # Arguments:
   #     st_date - a date indicating the start day of the window
   #     dframe - a data frame
-  # weight
-  # time_unit
-  # window_length
-
-
+  #     window_length
+  # Returns:
+  #     fe_coefs - the coefficients from the fe TPD model. 1 coefficient for
+  #         each time unit in window_length EXCEPT the first
+  #         Length is window length - 1
 
   # Get the dates of each day in this window
-  win_dates <- get_win_dates(st_date, time_unit, window_length)
+  win_dates <- get_win_dates(st_date, window_length)
   # Subset dframe by the dates in this window
-  dframe_win <- filter(dframe, times %in% win_dates)
-
+  dframe_win <- dframe %>%
+    filter(times_index %in% win_dates)
 
   # Run the linear model and extract the coefficients from the regression
-  lm_coefs_all <- lmfun(dframe_win) %>%
-    coef()
-
-
-  # Choose only the coefficients for month (disregard the intercept, and the
-  # coefficients for the product id). This is done based on the name of the
-  # columns
-  fe_coefs <- lm_coefs_all[!is.na(str_extract(names(lm_coefs_all),
-                                              "timefact\\d+"))]
+  fe_coefs <- lmfun(dframe_win)
 
   # fe_coefs should equal the length of window minus the 1. The reason it is -1
   # is due to the fact that 1 coefficient is sacraficed to intercept
-  if ( (length(fe_coefs) + 1) != window_length){
+  if ((length(fe_coefs) + 1) != window_length){
     # TODO Should this be an error?
     cat("The number of time coefficients does not match the window lenght?\n")
     cat("Is there a day missing?\n")
@@ -461,24 +363,18 @@ lmfun <- function(dframe){
   #   modelOutput - the output of the linear model
 
 
-  if (all(dframe$weight == 1)){
-    weight <- NULL
-  } else {
-    weight <- dframe$weight
-  }
-
-
   # Refactor the dates here. Otherwise columns are created in the regression
   # matrix with all zeros, corrosponding to dates not in the current window
-  dframe$timefact <- factor(dframe$times)
-  dframe$IDfact <- as.factor(dframe$id)
+  dframe$timefact <- factor(dframe$times_index)
+  dframe$IDfact <- factor(dframe$id)
 
   # glm uses the alpabetically first id as the reference. However, if this
   # value doesn't appear in the then all other values are being compared
   # to a numer that is essentially zero. Hence you can get crazily high numbers
   # like indexes of 10^50 from normal looking data
-  dframe <- within(dframe, IDfact <- relevel(IDfact,
-                                         ref = as.character(dframe$IDfact[1])))
+  dframe <- within(dframe,
+                   IDfact <- relevel(IDfact,
+                                     ref = as.character(dframe$IDfact[1])))
 
 
   # Regression doesn't work if there is only 1 item in the time window.
@@ -488,27 +384,52 @@ lmfun <- function(dframe){
     glm_formula <- dframe$logprice ~ dframe$timefact + dframe$IDfact
   }
 
-  # use the try catch as glm seems more robust, but glm4 is more
-  # memory efficient with large dataframes (due to sparse = T)
+  # make the design matrix - model.Matrix is used due to support for
+  # sparce matricies
+  design_mat <- model.Matrix(glm_formula, sparse = TRUE)
 
-  model_output <- tryCatch({
-    glm4(glm_formula, weights = weight,
-         sparse = TRUE)
-  }, warning = function(w) {
-    # cat("glm4 threw a warning, using glm\n")
-    glm(glm_formula, weights = weight)
-  }, error = function(e) {
-    # cat("glm4 threw an error, using glm\n")
-    glm(glm_formula, weights = weight)
-  }, finally = {
-    # some finally code here
-  })
+  # and run the linear regression. glmnet used for sparce support
+  all_coefs <- glmnet (x = design_mat,
+                       y = dframe$logprice,
+                       weights = dframe$weight,
+                       lambda = 0) %>%
+    coef()
 
-  return(model_output)
+  # all_coefs <-  glm4(glm_formula,
+  #                    weights = dframe$weight,
+  #                    sparse = TRUE) %>%
+  #   coef()
+
+
+  # There are coefficients returned for each time period, and each product.
+  # we are only interested in change of price wrt time - so only keep theses
+  # coefficients
+
+  # use this for glmnet
+  rows_keep <- grepl(".*timefact.*",
+                     rownames(all_coefs))
+
+  # use this for glm4
+  # rows_keep <- grepl(".*timefact.*",
+  #                    names(all_coefs))
+
+
+
+  # Return
+  # use this for glmnet
+  all_coefs[rows_keep, ]
+
+  # use this for glm4
+  # all_coefs[rows_keep]
+
+
 }
 
 
-get_fe_list <- function (fe_indexes, window_st_days, time_unit, window_length) {
+get_fe_list <- function (fe_indexes,
+                         dframe,
+                         window_st_days,
+                         window_length) {
   # Takes the lm model outputs and makes a list with of dataframes containing
   # Regression coefficients (i.e. indexes) and correct dates
   #
@@ -530,14 +451,20 @@ get_fe_list <- function (fe_indexes, window_st_days, time_unit, window_length) {
 
   # Loop over each window and construct the DF
   for (i in 1:ncol(fe_indexes)){
+    # get the times_indexes for the current window
+    times_temp <- get_win_dates(window_st_days[i],
+                              window_length = window_length)
+    # Convert theses to times, and keep only unique values
+    times_temp <- dframe$times[dframe$times_index %in% times_temp]
+    times_temp <- unique(times_temp)
+
+    # Make the df for this list entry
     fe_list[[i]] <- data.frame(
-      price_date = get_win_dates(window_st_days[i],
-                               time_unit = time_unit,
-                               window_length = window_length),
+      price_date = times_temp,
       fe_indexes = fe_indexes[, i],
       window_id = i)
 
-    # row names are junk due to times as factors and rbing rows earlier
+    # row names are junk due to: times as factors, and rbinding rows
     rownames(fe_list[[i]]) <- c()
   }
   return (fe_list)
@@ -567,8 +494,8 @@ get_fews_df <- function (fe_list, window_length, splice_pos) {
     old_fews <- fews$fe_indexes[nrow(fews)]
 
     update_factor <- splice_update (old_window,
-                                   new_window,
-                                   splice_pos = splice_pos)
+                                    new_window,
+                                    splice_pos = splice_pos)
 
     # Get the "new" FEWS index value
     new_fews <- old_fews * update_factor
@@ -578,8 +505,8 @@ get_fews_df <- function (fe_list, window_length, splice_pos) {
     last_date <- fe_list[[i]]$price_date[nrow(fe_list[[i]])]
 
     new_row <- data.frame(price_date = last_date,
-                         fe_indexes = new_fews,
-                         window_id = i)
+                          fe_indexes = new_fews,
+                          window_id = i)
 
     fews <- rbind(fews, new_row)
   }
@@ -609,7 +536,7 @@ splice_update <- function (win_old, win_new, splice_pos){
   #     the windows. Can also be 'mean' or 'window' for differnt splice types
   #
   # Returns
-  #   update_factor - the splice update factor
+  #   update_factor -  a single number which is the splice update factor
 
   stopifnot(length(win_old) == length(win_new))
   w <- length(win_old)
