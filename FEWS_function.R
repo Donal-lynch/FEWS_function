@@ -1,3 +1,13 @@
+library(algorithmia)
+library(dplyr)
+library(MatrixModels)
+library(glmnet)
+library(doSNOW)
+library(pbapply)
+
+
+### User Functions -----------------------------------------------------------
+
 #' @param times: vector of the times at which price observations were made. can be date or numeric
 #' @param logprice: vector of logarithm of prices at the given time
 #' @param id: vector of distinct identification number of consumer goods
@@ -8,21 +18,13 @@
 #' @param num_cores: Number of cores to use for parrallell computaion. Convention is parallel::detectCores()-1 on local machines
 #' @param return_fe_list: Option to return the indexes from all FE windows
 
-
-library(dplyr)
-library(MatrixModels)
-library(glmnet)
-library(doSNOW)
-library(pbapply)
-
-
-# User Function -----------------------------------------------------------
-
-FEWS <-  function(arg_list) {
-  # Function to calculate the Fixed effects window splice price index from
+FEWS <-  function(times, logprice, id, window_length, weight = NULL,
+                  splice_pos = "mean", return_fe_list = FALSE,
+                  num_cores=NULL) {
+  # Function to calculte the Fixed effects window splice price index from
   # a time series of prices
   # Arguments:
-  #   arg_list <- See top of script for detials of each list element
+  #   See top of script for detials of each argument
   #
   # Returns:
   #   output - a list of 1 or 2 items, depeding on return_fe_list argument.
@@ -34,17 +36,9 @@ FEWS <-  function(arg_list) {
 
   timer <- Sys.time() # Get the current time
 
-  # unpack the arguments list:
-  c(times,
-    logprice,
-    id,
-    weight,
-    window_length,
-    splice_pos,
-    return_fe_list,
-    num_cores) %=% arg_list
-
-  # check arguments are all ok
+  # check arguments are all legit
+  # times will be converted to numeric if it is a date, and a date_flag is
+  # returned so that the times can be coerced back into a date before returning
   c(times, logprice, id, weight, window_length, splice_pos) %=%
     check_inputs (times = times,
                   logprice = logprice,
@@ -70,16 +64,7 @@ FEWS <-  function(arg_list) {
   # this is to allow the input to be either Dates of numeric
   prices.df <- add_times_index (prices.df)
 
-
-  # Impute missing times
-  # prices.df <- time_imputer (dframe = prices.df,
-  #                            time_col = "times",
-  #                            price_col = "logprice",
-  #                            id_col = "id",
-  #                            time_unit = time_unit,
-  #                            weight_col = "weight")
-
-
+  
   # Get the indexes of the start of each window
   window_st_days <- get_window_st_days (dframe = prices.df,
                                         window_length = window_length)
@@ -119,9 +104,9 @@ FEWS <-  function(arg_list) {
   } else {
     # Non parallell code
     fe_indexes <- pblapply(X = window_st_days,
-                         FUN = FE_model,
-                         df = prices.df,
-                         window_length = window_length)
+                           FUN = FE_model,
+                           df = prices.df,
+                           window_length = window_length)
 
     # this list needs to be coerced into a df to match the foreach output
     # First convert each individual element into a df
@@ -162,6 +147,31 @@ FEWS <-  function(arg_list) {
 }
 
 
+### Algorithmia Functions -----------------------------------------------------------
+
+client <- getAlgorithmiaClient()
+### API Entry point
+### SAMPLE JSON: {"datafile":"data://jpeck/fews/SYNTHETIC.csv", "window_length":5,"splice_pos":"mean","return_fe_list": true}
+
+algorithm <- function(input){
+	# Function for use with the Algorithmia API
+	# This function only servers as a wrapper for the FEWS function
+	# to interface with Algoithmia
+	
+    # read the csv into memory
+    synt_data <- read.csv(client$file(input$datafile)$getFile())
+	# Call the FEWS funciton
+    fews_op <- FEWS(times = synt_data$month_num,
+        logprice = log(synt_data$value / synt_data$quantity),
+        id = synt_data$prodid_num,
+        weight = synt_data$value,
+        window_length = input$window_length,
+        splice_pos = input$splice_pos,
+        return_fe_list = input$return_fe_list,
+        num_cores = NULL)
+		
+  return (fews_op)
+}
 
 
 ### HELPER FUNCTIONS --------------------------------------------------------
@@ -215,7 +225,8 @@ check_inputs <- function (times = times, logprice = logprice, id = id,
     stop("times and id should be vectors of the same length")
   }else if (length(times) != length(weight)){
     stop("times and weight should be vectors of the same length")
-  }else if (length(window_length) != 1 | class(window_length) != "numeric"){
+  }else if (!(length(window_length) == 1 &
+              class(window_length) %in% c("numeric", "integer"))) {
     stop("window_length should be a single number")
   } #else if (!(class(times) %in% c("zoo", "Date", "numeric", "integer"))){
   #   stop (paste("The price times class is: ",
@@ -247,7 +258,7 @@ check_inputs <- function (times = times, logprice = logprice, id = id,
            paste(splice_pos_all, collapse = ", "))
     }
     # Theses two options all easy to convert to a number:
-    if (splice_pos ==  "window")  splice_pos <- 3
+    if (splice_pos ==  "window")  splice_pos <- 2
     if (splice_pos == "half") splice_pos <- ceiling(window_length / 2)
 
   } else{
@@ -283,6 +294,7 @@ add_times_index <- function (dframe) {
   return (dframe)
 
 }
+
 
 
 get_window_st_days <- function (dframe, window_length) {
@@ -388,6 +400,11 @@ lmfun <- function(dframe){
   # sparce matricies
   design_mat <- model.Matrix(glm_formula, sparse = TRUE)
 
+  # print(dframe$times_index[1])
+  if (dframe$times_index[1] == 59) {
+    # browser()
+  }
+
   # and run the linear regression. glmnet used for sparce support
   all_coefs <- glmnet (x = design_mat,
                        y = dframe$logprice,
@@ -453,7 +470,7 @@ get_fe_list <- function (fe_indexes,
   for (i in 1:ncol(fe_indexes)){
     # get the times_indexes for the current window
     times_temp <- get_win_dates(window_st_days[i],
-                              window_length = window_length)
+                                window_length = window_length)
     # Convert theses to times, and keep only unique values
     times_temp <- dframe$times[dframe$times_index %in% times_temp]
     times_temp <- unique(times_temp)
@@ -554,10 +571,10 @@ splice_update <- function (win_old, win_new, splice_pos){
 
   if (splice_pos == "mean") {
     t_accum <- c() # Accumulator for the t loop
-    for (t in seq(1, w - 1)) {
+    for (t in seq(from = 1, to = w - 1, by = 1)) {
       Pt1_new <- win_new[t + 1]
       Pt1_old <- win_old[t + 1]
-      t_accum <- c(t_accum, (Pw1_new / Pt1_new) / (Pw_old / Pt1_old))
+      t_accum <- c(t_accum, ((Pw1_new / Pt1_new) / (Pw_old / Pt1_old)))
     }
     update_factor <- gm_mean(t_accum)
   }else if (splice_pos == "movement") {
